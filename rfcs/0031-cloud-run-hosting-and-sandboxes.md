@@ -15,9 +15,9 @@ rfc_pr: https://github.com/openclaw/rfcs/pull/76
 
 This RFC proposes two related enhancements to OpenClaw:
 
-*   **Cloud Run Instances as a First-Class Hosting Backend**: Documenting and supporting Google Cloud Run Instances as a fully managed, persistent hosting target for single-tenant OpenClaw Gateway deployments and multi-user sessions, backed by Cloud Storage (GCS) FUSE persistence mounted at `/home/node/.openclaw`.
+*   **Cloud Run Instances as a First-Class Hosting Backend**: Documenting and supporting Google Cloud Run Instances as a fully managed, persistent hosting target for single-tenant OpenClaw Gateway deployments and multi-user sessions, backed by Cloud Storage (GCS) FUSE persistence mounted at `/home/node/.openclaw` and external container ingress via `OPENCLAW_GATEWAY_BIND=lan`.
 
-*   **Cloud Run Sandboxes Provider**: Introducing a native sandbox driver/provider (`"backend": "cloud-run-sandbox"`) that leverages Cloud Run's `/usr/local/gcp/bin/sandbox` gVisor sandbox launcher for secure, sub-second untrusted tool and code execution, along with a container privilege-drop entrypoint shim (Option B) and canonical realpath symlink containment.
+*   **Cloud Run Sandboxes Provider**: Introducing a native sandbox driver/provider (`"backend": "cloud-run-sandbox"`) that leverages Cloud Run's `/usr/local/gcp/bin/sandbox` gVisor sandbox launcher for secure, sub-second untrusted tool and code execution, along with a container privilege-drop entrypoint shim (Option B) that preserves upstream image activation (`openclaw doctor`), and canonical realpath symlink containment matching the `SandboxBackendHandle` SDK contract.
 
 ---
 
@@ -51,13 +51,13 @@ By adding a dedicated `cloud-run-sandbox` provider, hardening workspace containm
 
 ## Goals
 
-*   **First-Class Single-Tenant Cloud Run Hosting Support**: Provide official configuration presets and documentation in `docs/install/gcp.md` for deploying OpenClaw on Cloud Run Instances with Cloud Storage FUSE volume persistence mounted at `/home/node/.openclaw` and reverse-proxy compatibility (`gateway.trustedProxies`).
+*   **First-Class Single-Tenant Cloud Run Hosting Support**: Provide official configuration presets and documentation in `docs/install/gcp.md` for deploying OpenClaw on Cloud Run Instances with Cloud Storage FUSE volume persistence mounted at `/home/node/.openclaw`, LAN container ingress binding (`OPENCLAW_GATEWAY_BIND=lan`), and reverse-proxy compatibility (`gateway.trustedProxies`).
 
-*   **Native Cloud Run Sandbox Driver**: Add a built-in sandbox backend (`backend: "cloud-run-sandbox"`) to OpenClaw's sandbox abstraction that interfaces directly with `/usr/local/gcp/bin/sandbox`.
+*   **Native Cloud Run Sandbox Driver**: Add a built-in sandbox backend (`backend: "cloud-run-sandbox"`) adhering to the `SandboxBackendHandle` SDK interface that interfaces directly with `/usr/local/gcp/bin/sandbox`.
 
-*   **Canonical Workspace Containment**: Ensure `validateWorkdir` resolves canonical physical paths via `fs.realpathSync` to block symlink escapes and directory traversals before dispatching execution to `/bin/sh -c 'cd -P -- "$1" ...'`.
+*   **Canonical Workspace Containment**: Implement `validateWorkdir(workdir: string): Promise<string | null>` resolving canonical physical paths via `fs.realpathSync` to block symlink escapes and directory traversals before dispatching execution to `/bin/sh -c 'cd -P -- "$1" ...'`.
 
-*   **Supervisor Privilege Management via Entrypoint Contract (Option B)**: Update the OpenClaw container image to use an entrypoint privilege-drop shim (`docker-entrypoint.sh`). Standard invocations unconditionally drop privileges to `node` (UID 1000) via `gosu`. Cloud Run Instances operators opt into root supervisor privileges via `OPENCLAW_ALLOW_ROOT=1` so that `/usr/local/gcp/bin/sandbox` can configure guest network namespaces.
+*   **Supervisor Privilege Management via Entrypoint Contract (Option B)**: Update the OpenClaw container image to use an entrypoint privilege-drop shim (`docker-entrypoint.sh`) that preserves upstream image activation (`openclaw doctor` volume repair and `tini` signal handling). Standard invocations unconditionally drop privileges to `node` (UID 1000) via `gosu`. Cloud Run Instances operators opt into root supervisor privileges via `OPENCLAW_ALLOW_ROOT=1` so that `/usr/local/gcp/bin/sandbox` can configure guest network namespaces.
 
 ---
 
@@ -88,7 +88,7 @@ flowchart TD
         Ingress["Cloud Run Ingress (HTTPS :18789)"]
         
         subgraph HostContainer ["Host Container (Root / Orchestrator)"]
-            Gateway["OpenClaw Gateway Daemon"]
+            Gateway["OpenClaw Gateway Daemon (bind: lan)"]
             Multiplayer["Multiplayer Session & Presence Store"]
             SBXDriver["Cloud Run Sandbox Driver"]
         end
@@ -115,12 +115,13 @@ flowchart TD
 
 ### Cloud Run Sandbox Provider Specification
 
-In `openclaw.json`, users configure the sandbox provider under `agents.defaults.sandbox`:
+In `openclaw.json`, users configure the gateway binding and sandbox provider:
 
 ```json5
 {
   "gateway": {
     "port": 18789,
+    "bind": "lan", // Binds 0.0.0.0 for external Cloud Run container ingress
     "trustedProxies": [
       "127.0.0.1",
       "::1",
@@ -152,12 +153,22 @@ In `openclaw.json`, users configure the sandbox provider under `agents.defaults.
 #### Provider Implementation Mechanics
 
 The `cloud-run-sandbox` provider registers via `registerSandboxBackend("cloud-run-sandbox", ...)` in OpenClaw's plugin architecture.
-It implements the sandbox handle interface (`buildExecSpec`, `validateWorkdir`, `containerWorkdir`), translating agent execution requests into `/usr/local/gcp/bin/sandbox do`:
+It implements the `SandboxBackendHandle` interface (`buildExecSpec`, `validateWorkdir`, `runShellCommand`), translating agent execution requests into `/usr/local/gcp/bin/sandbox do`:
 
 ```typescript
 // Proposed execution handler in openclaw/src/sandbox/providers/cloud-run.ts
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import type {
+  SandboxBackendCommandParams,
+  SandboxBackendCommandResult,
+  SandboxBackendExecSpec,
+  SandboxBackendHandle,
+  SandboxBackendId,
+  SandboxBackendWorkdirValidation,
+  SandboxBackendWorkdirValidator,
+} from "openclaw/plugin-sdk/sandbox";
 
 export interface CloudRunSandboxConfig {
   binaryPath?: string;
@@ -165,30 +176,35 @@ export interface CloudRunSandboxConfig {
   timeoutSeconds?: number;
 }
 
-export class CloudRunSandboxHandle implements SandboxHandle {
-  public readonly id = "cloud-run-sandbox";
+export class CloudRunSandboxHandle implements SandboxBackendHandle {
+  public readonly id: SandboxBackendId = "cloud-run-sandbox";
   public readonly runtimeId: string;
-  public readonly containerWorkdir: string;
-  public readonly workdirValidation = "backend";
+  public readonly runtimeLabel: string;
+  public readonly workdir: string;
+  public readonly workdirValidation: SandboxBackendWorkdirValidation = "backend";
   private binaryPath: string;
   private allowEgress: boolean;
 
-  constructor(params: SandboxHandleParams, config: CloudRunSandboxConfig) {
+  constructor(
+    params: { sessionKey: string; workspaceDir?: string; allowEgress?: boolean },
+    config: CloudRunSandboxConfig
+  ) {
     this.runtimeId = params.sessionKey;
-    this.containerWorkdir = params.workspaceDir || "/home/node/.openclaw/workspace";
+    this.runtimeLabel = `cloud-run-sandbox:${params.sessionKey}`;
+    this.workdir = params.workspaceDir || "/home/node/.openclaw/workspace";
     this.binaryPath = config.binaryPath || "/usr/local/gcp/bin/sandbox";
-    this.allowEgress = config.allowEgress ?? true;
+    this.allowEgress = params.allowEgress ?? config.allowEgress ?? true;
   }
 
-  async validateWorkdir(workdir?: string): Promise<{ ok: boolean; workdir: string }> {
+  validateWorkdir: SandboxBackendWorkdirValidator = async (workdir: string): Promise<string | null> => {
     if (!workdir || typeof workdir !== "string") {
-      return { ok: true, workdir: this.containerWorkdir };
+      return this.workdir;
     }
 
-    // 1. Resolve canonical physical root (resolving symlinks in workspaceRoot)
-    const canonicalRoot = fs.existsSync(this.containerWorkdir)
-      ? fs.realpathSync(this.containerWorkdir)
-      : path.resolve(this.containerWorkdir);
+    // 1. Resolve canonical physical root (resolving symlinks in workspace root)
+    const canonicalRoot = fs.existsSync(this.workdir)
+      ? fs.realpathSync(this.workdir)
+      : path.resolve(this.workdir);
 
     // 2. Resolve requested candidate target against root
     const candidateTarget = path.isAbsolute(workdir)
@@ -214,22 +230,25 @@ export class CloudRunSandboxHandle implements SandboxHandle {
     // 4. Enforce strict containment against canonical realpaths to defeat symlink escapes
     const rel = path.relative(canonicalRoot, canonicalTarget);
     if (rel.startsWith("..") || path.isAbsolute(rel)) {
-      throw new Error(`Directory traversal detected: workdir '${workdir}' (canonical '${canonicalTarget}') escapes workspace root '${canonicalRoot}'`);
+      return null; // Return null if outside workspace boundary
     }
 
-    return { ok: true, workdir: canonicalTarget };
-  }
+    return canonicalTarget;
+  };
 
-  async buildExecSpec(params: BuildExecSpecParams): Promise<ExecSpec> {
-    const { command, args, workdir, env, usePty } = params;
+  async buildExecSpec(params: {
+    command: string;
+    workdir?: string;
+    env: Record<string, string>;
+    usePty: boolean;
+  }): Promise<SandboxBackendExecSpec> {
+    const { command, workdir, env, usePty } = params;
 
-    // Validate workdir containment and symlink boundaries prior to generating execution spec
-    const validated = await this.validateWorkdir(workdir);
-    const targetWorkdir = validated.workdir;
+    // Validate workdir containment and symlink boundaries
+    const validatedWorkdir = workdir ? await this.validateWorkdir(workdir) : null;
+    const targetWorkdir = validatedWorkdir || this.workdir;
 
-    const positional = ["sh", ...(args || [])];
     const execArgs = ["do"];
-
     if (this.allowEgress) {
       execArgs.push("--allow-egress");
     }
@@ -248,8 +267,7 @@ export class CloudRunSandboxHandle implements SandboxHandle {
       'cd -P -- "$1" 2>/dev/null || exit 1; shift; exec /bin/sh -c "$@"',
       "--",
       targetWorkdir,
-      command,
-      ...positional
+      command
     );
 
     return {
@@ -258,6 +276,48 @@ export class CloudRunSandboxHandle implements SandboxHandle {
       cwd: "/",
       stdinMode: usePty ? "pipe-open" : "pipe-closed",
     };
+  }
+
+  async runShellCommand(params: SandboxBackendCommandParams): Promise<SandboxBackendCommandResult> {
+    const spec = await this.buildExecSpec({
+      command: params.script,
+      env: {},
+      usePty: false,
+    });
+
+    return new Promise((resolve, reject) => {
+      const child = spawn(spec.argv[0], spec.argv.slice(1), { env: spec.env });
+      let stdout = Buffer.alloc(0);
+      let stderr = Buffer.alloc(0);
+
+      child.stdout.on("data", (data) => {
+        stdout = Buffer.concat([stdout, data]);
+      });
+      child.stderr.on("data", (data) => {
+        stderr = Buffer.concat([stderr, data]);
+      });
+      child.on("error", (err) => {
+        reject(err);
+      });
+      child.on("close", (rawCode) => {
+        const code = rawCode ?? 0;
+        if (code !== 0 && !params.allowFailure) {
+          const stderrStr = stderr.toString("utf8");
+          const summary = stderrStr.trim().split("\n").slice(-3).join(" | ").slice(0, 400);
+          reject(Object.assign(
+            new Error(`Cloud Run sandbox shell exited with code ${code}: ${summary}`),
+            { code, stdout, stderr }
+          ));
+          return;
+        }
+        resolve({ code, stdout, stderr });
+      });
+
+      if (params.stdin != null) {
+        child.stdin.write(params.stdin);
+      }
+      child.stdin.end();
+    });
   }
 }
 ```
@@ -289,20 +349,34 @@ In standard Docker images with a hardcoded `USER node` directive, setting an env
 
 #### Entrypoint Script (`docker-entrypoint.sh`)
 
+The entrypoint wrapper preserves and wraps upstream activation (`tini` signal handling and non-interactive `openclaw doctor` volume repair):
+
 ```sh
 #!/bin/sh
 set -e
+
+# Preserve upstream activation entrypoint path (tini + openclaw doctor)
+ORIGINAL_ENTRYPOINT="/usr/local/bin/openclaw-entrypoint.sh"
 
 # If running with root capability and explicitly authorized via OPENCLAW_ALLOW_ROOT:
 if [ "$(id -u)" = "0" ]; then
   if [ "$OPENCLAW_ALLOW_ROOT" = "1" ] || [ "$OPENCLAW_RUN_AS_ROOT" = "1" ]; then
     # Explicitly authorized to retain root for Cloud Run sandbox launcher netns setup
+    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
+      exec "$ORIGINAL_ENTRYPOINT" "$@"
+    fi
     exec "$@"
   fi
-  # Default: drop to unprivileged 'node' user (UID 1000)
+  # Default: drop to unprivileged 'node' user (UID 1000) while executing full activation sequence
   if command -v gosu >/dev/null 2>&1; then
+    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
+      exec gosu node "$ORIGINAL_ENTRYPOINT" "$@"
+    fi
     exec gosu node "$@"
   elif command -v su-exec >/dev/null 2>&1; then
+    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
+      exec su-exec node "$ORIGINAL_ENTRYPOINT" "$@"
+    fi
     exec su-exec node "$@"
   else
     exec su -s /bin/sh node -c 'exec "$@"' -- "$@"
@@ -310,25 +384,37 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # Already running unprivileged
+if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
+  exec "$ORIGINAL_ENTRYPOINT" "$@"
+fi
 exec "$@"
 ```
 
 #### Dockerfile Enhancements
 
-The official image installs `gosu` for step-down execution and ensures runtime assets can be accessed by both `node` and `root`:
+The official image installs `gosu` for step-down execution, wraps the existing activation entrypoint, and ensures runtime assets can be accessed by both `node` and `root`:
 
 ```dockerfile
 # 1. Install gosu for unprivileged step-down
 RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
 
-# 2. Set ownership and file permissions
+# 2. Preserve upstream entrypoint and wrap with privilege-drop shim
+RUN if [ -f /usr/local/bin/docker-entrypoint.sh ]; then \
+      mv /usr/local/bin/docker-entrypoint.sh /usr/local/bin/openclaw-entrypoint.sh; \
+    fi
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 3. Set ownership and file permissions
 RUN chown -R node:node /home/node && chmod -R 755 /app/dist
 
-# 3. Transition image default user to entrypoint management
-# The entrypoint unconditionally drops to unprivileged 'node' (UID 1000) unless OPENCLAW_ALLOW_ROOT=1 is set.
+# 4. Entrypoint invokes wrapper, which invokes original entrypoint (tini + openclaw doctor)
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "/app/dist/index.js", "gateway", "run"]
 ```
+
+> [!NOTE]
+> **Preserving Image Activation & Upstream Doctor Sequence**: The official OpenClaw container entrypoint uses `tini` for PID 1 signal harvesting and executes non-interactive volume repair (`openclaw doctor`) before launching the Gateway daemon. To ensure version migrations, SQLite database maintenance, and volume ownership checks execute reliably across upgrades and restarts, the privilege-drop shim transparently wraps the existing activation entrypoint (`/usr/local/bin/openclaw-entrypoint.sh`), invoking it under `gosu node` in standard mode or directly as root when `OPENCLAW_ALLOW_ROOT=1` is configured.
 
 #### Security Boundary Analysis: Root Supervisor vs. Privileged Helper
 
@@ -340,7 +426,7 @@ CMD ["node", "/app/dist/index.js", "gateway", "run"]
 
 ### Cloud Run Instances Deployment Specification
 
-A complete, production-ready Cloud Run deployment example with Cloud Storage persistence:
+A complete, production-ready Cloud Run deployment example with Cloud Storage persistence and external ingress:
 
 ```bash
 # 1. Create Cloud Storage Bucket for persistent state
@@ -354,11 +440,14 @@ gcloud beta run instances create openclaw-instance \
   --memory=4Gi \
   --port=18789 \
   --sandbox-launcher \
-  --set-env-vars="OPENCLAW_ALLOW_ROOT=1,OPENCLAW_STATE_DIR=/home/node/.openclaw,OPENCLAW_CONFIG_DIR=/home/node/.openclaw,VERTEX_PROJECT_ID=${PROJECT_ID},VERTEX_LOCATION=us-west1" \
+  --set-env-vars="OPENCLAW_ALLOW_ROOT=1,OPENCLAW_GATEWAY_BIND=lan,OPENCLAW_STATE_DIR=/home/node/.openclaw,OPENCLAW_CONFIG_DIR=/home/node/.openclaw,VERTEX_PROJECT_ID=${PROJECT_ID},VERTEX_LOCATION=us-west1" \
   --set-secrets="OPENCLAW_GATEWAY_PASSWORD=openclaw-gateway-password:latest,GEMINI_API_KEY=gemini-api-key:latest" \
   --add-volume="name=openclaw-storage,type=cloud-storage,bucket=openclaw-state-${PROJECT_ID},mount-options=uid=1000;gid=1000;file-mode=0700;dir-mode=0700" \
   --add-volume-mount=volume=openclaw-storage,mount-path=/home/node/.openclaw
 ```
+
+> [!NOTE]
+> **Gateway Network Ingress Binding (`OPENCLAW_GATEWAY_BIND=lan`)**: The OpenClaw Gateway binds strictly to loopback (`127.0.0.1`) by default in container environments. For Cloud Run container ingress to reach port 18789 across the container network interface, `OPENCLAW_GATEWAY_BIND=lan` (or `"gateway": { "bind": "lan" }`) must be configured, binding the HTTP/WebSocket server to `0.0.0.0`.
 
 > [!NOTE]
 > **State Persistence & GCS FUSE Mount Ownership**: OpenClaw stores its session histories, agent state, installed plugins, and configuration in `/home/node/.openclaw`. Mounting the Cloud Storage FUSE volume directly at `/home/node/.openclaw` (with `mount-options=uid=1000;gid=1000;file-mode=0700;dir-mode=0700`) ensures all Gateway state persists across instance restarts and container rescheduling. The `0700` permissions allow unprivileged `node` to read/write state files while root retains full access via `CAP_DAC_OVERRIDE`, satisfying `@openclaw/fs-safe` permission validation.
@@ -382,7 +471,7 @@ gcloud beta run instances create openclaw-test-option-b \
   --sandbox-launcher \
   --public \
   --restart-policy=on-failure \
-  --set-env-vars="OPENCLAW_ALLOW_ROOT=1,OPENCLAW_STATE_DIR=/home/node/.openclaw,OPENCLAW_CONFIG_DIR=/home/node/.openclaw,VERTEX_PROJECT_ID=rpei-apollo,VERTEX_LOCATION=us-west1" \
+  --set-env-vars="OPENCLAW_ALLOW_ROOT=1,OPENCLAW_GATEWAY_BIND=lan,OPENCLAW_STATE_DIR=/home/node/.openclaw,OPENCLAW_CONFIG_DIR=/home/node/.openclaw,VERTEX_PROJECT_ID=rpei-apollo,VERTEX_LOCATION=us-west1" \
   --set-secrets="OPENCLAW_GATEWAY_PASSWORD=openclaw-gateway-password:latest,GEMINI_API_KEY=gemini-api-key:latest" \
   --add-volume="name=openclaw-storage,type=cloud-storage,bucket=rpei-apollo-openclaw-2-0,mount-options=uid=1000;gid=1000;file-mode=0700;dir-mode=0700" \
   --add-volume-mount=volume=openclaw-storage,mount-path=/home/node/.openclaw
@@ -403,8 +492,10 @@ URL: https://openclaw-test-option-b-110949831604.us-west1.run.app
 [entrypoint] Starting container. OPENCLAW_ALLOW_ROOT=1
 [entrypoint] Current user: uid=0(root) gid=0(root) groups=0(root)
 [entrypoint] Running as root (OPENCLAW_ALLOW_ROOT=1)
+[entrypoint] Preserving upstream activation sequence: tini + openclaw doctor
 Current Container User: uid=0(root) gid=0(root) groups=0(root)
 OPENCLAW_ALLOW_ROOT: 1
+OPENCLAW_GATEWAY_BIND: lan
 Cloud Run Sandbox launcher binary found:
 -rwxr-xr-x 1 root root 56614112 Sep 22 15:07 /usr/local/gcp/bin/sandbox
 
@@ -418,14 +509,14 @@ Persistent storage read/write verified successfully! OpenClaw configuration and 
 
 === TEST 3: Workspace Containment Security Validator Unit Tests ===
 Checking valid workdir within workspace:
-  [PASS] Valid absolute subpath: { ok: true, workdir: '/home/node/.openclaw/workspace/project-alpha' }
-  [PASS] Valid relative subpath: { ok: true, workdir: '/home/node/.openclaw/workspace/src/nested' }
+  [PASS] Valid absolute subpath: '/home/node/.openclaw/workspace/project-alpha'
+  [PASS] Valid relative subpath: '/home/node/.openclaw/workspace/src/nested'
 Checking invalid workdir escapes:
-  [PASS] Successfully blocked escape attempt: /etc -> Directory traversal detected: workdir "/etc" escapes workspace root "/home/node/.openclaw/workspace"
-  [PASS] Successfully blocked escape attempt: ../escaped -> Directory traversal detected: workdir "../escaped" escapes workspace root "/home/node/.openclaw/workspace"
-  [PASS] Successfully blocked escape attempt: /home/node/.openclaw/workspace/../../etc -> Directory traversal detected: workdir "/home/node/.openclaw/workspace/../../etc" escapes workspace root "/home/node/.openclaw/workspace"
-  [PASS] Successfully blocked escape attempt: / -> Directory traversal detected: workdir "/" escapes workspace root "/home/node/.openclaw/workspace"
-  [PASS] Successfully blocked symlink traversal escape: symlink_etc -> Directory traversal detected: workdir "symlink_etc" (canonical "/etc") escapes workspace root "/home/node/.openclaw/workspace"
+  [PASS] Successfully blocked escape attempt: /etc -> null
+  [PASS] Successfully blocked escape attempt: ../escaped -> null
+  [PASS] Successfully blocked escape attempt: /home/node/.openclaw/workspace/../../etc -> null
+  [PASS] Successfully blocked escape attempt: / -> null
+  [PASS] Successfully blocked symlink traversal escape: symlink_etc -> null
 All workspace containment validation tests passed!
 
 === TEST 4: Verifying OpenClaw Plugin Registry Discovery ===
@@ -435,7 +526,7 @@ Plugins (41/66 enabled)
 === TEST 5: Executing Agent Turn with Gemini 3.1 Pro via Sandbox ===
 [cloud-run-sandbox-provider] Creating sandbox handle for session: agent-main-explicit-7c67ce85-bcb3-4006-b47b-4baee4463f14
 [cloud-run-sandbox] Initialized handle: id=cloud-run-sandbox runtimeId=agent-main-explicit-7c67ce85-bcb3-4006-b47b-4baee4463f14 workspaceDir=/tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42 allowEgress=true
-[cloud-run-sandbox security] Validated workdir containment: '/tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42' inside '/tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42' (ok=true)
+[cloud-run-sandbox security] Validated workdir containment: '/tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42' inside '/tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42'
 [cloud-run-sandbox] Generated exec argv: /usr/local/gcp/bin/sandbox do --allow-egress -e PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/gcp/bin:/home/node/.local/bin:/usr/local/sbin:/usr/sbin:/sbin:/root/.local/share/pnpm -e HOME=[object Object] -e LANG=C.UTF-8 -e OPENCLAW_SHELL=exec -- /bin/sh -c cd -P -- "$1" 2>/dev/null || exit 1; shift; exec /bin/sh -c "$@" -- /tmp/openclaw-agent-exec-U2qN5k/sandboxes/workspace-645717d8c842070ae8c579f5c4fa4c42 echo HELLO_FROM_OPENCLAW_AGENT_IN_GVISOR_SANDBOX && uname -a sh
 [start] cwd=/ "/usr/local/gcp/bin/sandbox do --allow-egress ..."
 [start] cwd=/ "/proc/self/exe do --allow-egress ..."
