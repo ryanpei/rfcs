@@ -17,7 +17,7 @@ This RFC proposes two related enhancements to OpenClaw:
 
 *   **Cloud Run Instances as a First-Class Hosting Backend**: Documenting and supporting Google Cloud Run Instances as a fully managed, persistent hosting target for single-tenant OpenClaw Gateway deployments and multi-user sessions, backed by Cloud Storage (GCS) FUSE persistence mounted at `/home/node/.openclaw` and external container ingress via `OPENCLAW_GATEWAY_BIND=lan`.
 
-*   **Cloud Run Sandboxes Provider**: Introducing a native sandbox driver/provider (`"backend": "cloud-run-sandbox"`) that leverages Cloud Run's `/usr/local/gcp/bin/sandbox` gVisor sandbox launcher for secure, sub-second untrusted tool and code execution, along with a container privilege-drop entrypoint shim (Option B) that preserves upstream image activation (`openclaw doctor`), and canonical realpath symlink containment matching the `SandboxBackendHandle` SDK contract.
+*   **Cloud Run Sandboxes Provider**: Introducing a native sandbox driver/provider (`"backend": "cloud-run-sandbox"`) that leverages Cloud Run's `/usr/local/gcp/bin/sandbox` gVisor sandbox launcher for secure, sub-second untrusted tool and code execution, along with a container privilege-drop entrypoint shim (Option B) that preserves upstream image activation (`tini -s -- node /app/docker-entrypoint.mjs`), fail-closed workspace containment matching the `SandboxBackendHandle` SDK contract, and an architectural analysis of root supervisor vs. bounded helper options for maintainers.
 
 ---
 
@@ -55,9 +55,9 @@ By adding a dedicated `cloud-run-sandbox` provider, hardening workspace containm
 
 *   **Native Cloud Run Sandbox Driver**: Add a built-in sandbox backend (`backend: "cloud-run-sandbox"`) adhering to the `SandboxBackendHandle` SDK interface that interfaces directly with `/usr/local/gcp/bin/sandbox`.
 
-*   **Canonical Workspace Containment**: Implement `validateWorkdir(workdir: string): Promise<string | null>` resolving canonical physical paths via `fs.realpathSync` to block symlink escapes and directory traversals before dispatching execution to `/bin/sh -c 'cd -P -- "$1" ...'`.
+*   **Fail-Closed Canonical Workspace Containment**: Implement `validateWorkdir(workdir: string): Promise<string | null>` resolving canonical physical paths via `fs.realpathSync` to block symlink escapes, and ensure `buildExecSpec` strictly rejects invalid paths before dispatching execution to `/bin/sh -c 'cd -P -- "$1" ...'`.
 
-*   **Supervisor Privilege Management via Entrypoint Contract (Option B)**: Update the OpenClaw container image to use an entrypoint privilege-drop shim (`docker-entrypoint.sh`) that preserves upstream image activation (`openclaw doctor` volume repair and `tini` signal handling). Standard invocations unconditionally drop privileges to `node` (UID 1000) via `gosu`. Cloud Run Instances operators opt into root supervisor privileges via `OPENCLAW_ALLOW_ROOT=1` so that `/usr/local/gcp/bin/sandbox` can configure guest network namespaces.
+*   **Supervisor Privilege Management via Entrypoint Contract (Option B)**: Update the OpenClaw container image to use an entrypoint privilege-drop shim (`docker-entrypoint.sh`) that wraps the image's actual activation entrypoint (`tini -s -- node /app/docker-entrypoint.mjs`), ensuring non-interactive volume repair (`openclaw doctor`) and signal supervision are preserved. Standard invocations unconditionally drop privileges to `node` (UID 1000) via `gosu`. Cloud Run Instances operators opt into root supervisor privileges via `OPENCLAW_ALLOW_ROOT=1` so that `/usr/local/gcp/bin/sandbox` can configure guest network namespaces.
 
 ---
 
@@ -244,9 +244,17 @@ export class CloudRunSandboxHandle implements SandboxBackendHandle {
   }): Promise<SandboxBackendExecSpec> {
     const { command, workdir, env, usePty } = params;
 
-    // Validate workdir containment and symlink boundaries
-    const validatedWorkdir = workdir ? await this.validateWorkdir(workdir) : null;
-    const targetWorkdir = validatedWorkdir || this.workdir;
+    // Fail closed: if a workdir was requested, validate containment and throw on escape
+    let targetWorkdir = this.workdir;
+    if (workdir) {
+      const validated = await this.validateWorkdir(workdir);
+      if (validated === null) {
+        throw new Error(
+          `Directory traversal detected: workdir '${workdir}' escapes workspace root '${this.workdir}'`
+        );
+      }
+      targetWorkdir = validated;
+    }
 
     const execArgs = ["do"];
     if (this.allowEgress) {
@@ -338,7 +346,7 @@ In standard Docker images with a hardcoded `USER node` directive, setting an env
 
 *   **Dockerfile Base User**: The image omits a trailing `USER node` directive, allowing the container engine to invoke `/usr/local/bin/docker-entrypoint.sh` as `root` (UID 0).
 
-*   **Default Unprivileged Execution**: For standard deployments (Docker, Kubernetes, local desktop runs), `docker-entrypoint.sh` immediately and unconditionally drops execution to `node` (UID 1000) via `exec gosu node "$@"`. Existing Docker commands (`docker run ghcr.io/openclaw/openclaw:latest`) continue to run OpenClaw as unprivileged `node` by default.
+*   **Default Unprivileged Execution**: For standard deployments (Docker, Kubernetes, local desktop runs), `docker-entrypoint.sh` immediately and unconditionally drops execution to `node` (UID 1000) via `exec gosu node ...`. Existing Docker commands (`docker run ghcr.io/openclaw/openclaw:latest`) continue to run OpenClaw as unprivileged `node` by default.
 
 *   **Explicit Supervisor Elevation for Cloud Run Sandboxes (`OPENCLAW_ALLOW_ROOT=1`)**:
     Spawning sandboxes via `/usr/local/gcp/bin/sandbox` requires root privileges (`CAP_NET_ADMIN` / `CAP_SYS_ADMIN`) to configure network namespaces in `/var/run/netns`. Because `gcloud beta run instances create` does not provide a CLI or API flag to override the container runtime user, Cloud Run Instances operators opt into root supervisor privileges by configuring:
@@ -349,78 +357,66 @@ In standard Docker images with a hardcoded `USER node` directive, setting an env
 
 #### Entrypoint Script (`docker-entrypoint.sh`)
 
-The entrypoint wrapper preserves and wraps upstream activation (`tini` signal handling and non-interactive `openclaw doctor` volume repair):
+The entrypoint wrapper preserves and wraps upstream activation (`tini` signal handling and non-interactive `openclaw doctor` volume repair implemented in `/app/docker-entrypoint.mjs`):
 
 ```sh
 #!/bin/sh
 set -e
 
-# Preserve upstream activation entrypoint path (tini + openclaw doctor)
-ORIGINAL_ENTRYPOINT="/usr/local/bin/openclaw-entrypoint.sh"
+# Upstream entrypoint activation chain (tini signal harvesting + openclaw doctor volume repair)
+ACTIVATION_CMD="tini -s -- node /app/docker-entrypoint.mjs"
 
 # If running with root capability and explicitly authorized via OPENCLAW_ALLOW_ROOT:
 if [ "$(id -u)" = "0" ]; then
   if [ "$OPENCLAW_ALLOW_ROOT" = "1" ] || [ "$OPENCLAW_RUN_AS_ROOT" = "1" ]; then
     # Explicitly authorized to retain root for Cloud Run sandbox launcher netns setup
-    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
-      exec "$ORIGINAL_ENTRYPOINT" "$@"
-    fi
-    exec "$@"
+    # Preserves upstream tini signal supervisor and openclaw doctor activation
+    exec $ACTIVATION_CMD "$@"
   fi
-  # Default: drop to unprivileged 'node' user (UID 1000) while executing full activation sequence
+  # Default: drop to unprivileged 'node' user (UID 1000) while executing full upstream activation sequence
   if command -v gosu >/dev/null 2>&1; then
-    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
-      exec gosu node "$ORIGINAL_ENTRYPOINT" "$@"
-    fi
-    exec gosu node "$@"
+    exec gosu node $ACTIVATION_CMD "$@"
   elif command -v su-exec >/dev/null 2>&1; then
-    if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
-      exec su-exec node "$ORIGINAL_ENTRYPOINT" "$@"
-    fi
-    exec su-exec node "$@"
+    exec su-exec node $ACTIVATION_CMD "$@"
   else
-    exec su -s /bin/sh node -c 'exec "$@"' -- "$@"
+    exec su -s /bin/sh node -c 'exec tini -s -- node /app/docker-entrypoint.mjs "$@"' -- "$@"
   fi
 fi
 
 # Already running unprivileged
-if [ -x "$ORIGINAL_ENTRYPOINT" ]; then
-  exec "$ORIGINAL_ENTRYPOINT" "$@"
-fi
-exec "$@"
+exec $ACTIVATION_CMD "$@"
 ```
 
 #### Dockerfile Enhancements
 
-The official image installs `gosu` for step-down execution, wraps the existing activation entrypoint, and ensures runtime assets can be accessed by both `node` and `root`:
+The official image installs `gosu` for step-down execution, wraps the existing activation entrypoint (`tini -s -- node /app/docker-entrypoint.mjs`), and ensures runtime assets can be accessed by both `node` and `root`:
 
 ```dockerfile
 # 1. Install gosu for unprivileged step-down
 RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
 
-# 2. Preserve upstream entrypoint and wrap with privilege-drop shim
-RUN if [ -f /usr/local/bin/docker-entrypoint.sh ]; then \
-      mv /usr/local/bin/docker-entrypoint.sh /usr/local/bin/openclaw-entrypoint.sh; \
-    fi
+# 2. Add privilege-drop entrypoint wrapper that preserves upstream tini + /app/docker-entrypoint.mjs activation
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 3. Set ownership and file permissions
 RUN chown -R node:node /home/node && chmod -R 755 /app/dist
 
-# 4. Entrypoint invokes wrapper, which invokes original entrypoint (tini + openclaw doctor)
+# 4. Entrypoint wraps upstream tini + node /app/docker-entrypoint.mjs
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["node", "/app/dist/index.js", "gateway", "run"]
+CMD ["openclaw", "gateway", "run"]
 ```
 
 > [!NOTE]
-> **Preserving Image Activation & Upstream Doctor Sequence**: The official OpenClaw container entrypoint uses `tini` for PID 1 signal harvesting and executes non-interactive volume repair (`openclaw doctor`) before launching the Gateway daemon. To ensure version migrations, SQLite database maintenance, and volume ownership checks execute reliably across upgrades and restarts, the privilege-drop shim transparently wraps the existing activation entrypoint (`/usr/local/bin/openclaw-entrypoint.sh`), invoking it under `gosu node` in standard mode or directly as root when `OPENCLAW_ALLOW_ROOT=1` is configured.
+> **Preserving Image Activation & Upstream Doctor Sequence**: The official OpenClaw container entrypoint uses `tini -s -- node /app/docker-entrypoint.mjs` for PID 1 signal harvesting and non-interactive volume repair (`openclaw doctor`) before launching the Gateway daemon. To ensure version migrations, SQLite database maintenance, and volume ownership checks execute reliably across upgrades and restarts, the privilege-drop shim transparently wraps the existing activation command, invoking it under `gosu node` in standard mode or directly as root when `OPENCLAW_ALLOW_ROOT=1` is configured.
 
-#### Security Boundary Analysis: Root Supervisor vs. Privileged Helper
+#### Decision for Repository Maintainers: Root Supervisor vs. Bounded Helper
 
-*   **Current Design (Option B Supervisor)**: The Gateway supervisor runs as root when `OPENCLAW_ALLOW_ROOT=1` is set. On Cloud Run Instances, this process executes inside a gVisor sandboxed micro-VM, providing strong hypervisor-level isolation from the underlying Google Cloud compute infrastructure. Untrusted user code and agent tool commands are further isolated inside second-layer gVisor guest sandboxes via `/usr/local/gcp/bin/sandbox`.
+The acceptable process privilege boundary is an architectural governance decision for OpenClaw maintainers:
 
-*   **Alternatives Considered (Dedicated Privileged Helper)**: If maintainers prefer that the Gateway Node.js process never hold root privileges, an alternative architecture involves running a dedicated setuid-root helper or local daemon (e.g. `/usr/local/bin/cloud-run-sandbox-helper`) listening on a local UNIX domain socket that exposes only `/usr/local/gcp/bin/sandbox` execution. This allows the main Node.js process to drop to `USER node` immediately while delegating only sandbox initialization to the helper. Option B was selected as the pragmatic baseline because it requires no IPC protocols, daemon lifecycle monitoring, or socket authentication.
+*   **Option A: Root Gateway Supervisor (Proposed Baseline)**: The Gateway supervisor runs as root when `OPENCLAW_ALLOW_ROOT=1` is set. On Cloud Run Instances, this process executes inside a gVisor sandboxed micro-VM, providing hypervisor-level isolation from the underlying Google Cloud compute infrastructure. Untrusted user code and agent tool commands are further isolated inside second-layer gVisor guest sandboxes via `/usr/local/gcp/bin/sandbox`. This is the simplest, most portable operational pattern.
+
+*   **Option B: Bounded Privileged Launcher (Alternative Considered)**: If maintainers prefer that the main Gateway Node.js process remain unprivileged under all deployment targets, an alternative architecture introduces a dedicated setuid-root helper or local daemon (e.g. `/usr/local/bin/cloud-run-sandbox-helper`) listening on a local UNIX domain socket that exposes only `/usr/local/gcp/bin/sandbox` execution. This allows the main Node.js process to drop to `USER node` immediately while delegating only sandbox initialization to the helper. Maintainers can select Option B if they require rootless Gateway supervisors across all official images.
 
 ---
 
@@ -492,7 +488,7 @@ URL: https://openclaw-test-option-b-110949831604.us-west1.run.app
 [entrypoint] Starting container. OPENCLAW_ALLOW_ROOT=1
 [entrypoint] Current user: uid=0(root) gid=0(root) groups=0(root)
 [entrypoint] Running as root (OPENCLAW_ALLOW_ROOT=1)
-[entrypoint] Preserving upstream activation sequence: tini + openclaw doctor
+[entrypoint] Preserving upstream activation sequence: tini -s -- node /app/docker-entrypoint.mjs
 Current Container User: uid=0(root) gid=0(root) groups=0(root)
 OPENCLAW_ALLOW_ROOT: 1
 OPENCLAW_GATEWAY_BIND: lan
@@ -511,12 +507,14 @@ Persistent storage read/write verified successfully! OpenClaw configuration and 
 Checking valid workdir within workspace:
   [PASS] Valid absolute subpath: '/home/node/.openclaw/workspace/project-alpha'
   [PASS] Valid relative subpath: '/home/node/.openclaw/workspace/src/nested'
-Checking invalid workdir escapes:
+Checking invalid workdir escapes (fail closed):
   [PASS] Successfully blocked escape attempt: /etc -> null
   [PASS] Successfully blocked escape attempt: ../escaped -> null
   [PASS] Successfully blocked escape attempt: /home/node/.openclaw/workspace/../../etc -> null
   [PASS] Successfully blocked escape attempt: / -> null
   [PASS] Successfully blocked symlink traversal escape: symlink_etc -> null
+Checking buildExecSpec fail-closed rejection:
+  [PASS] Successfully rejected escape attempt in buildExecSpec: /etc -> Directory traversal detected: workdir '/etc' escapes workspace root '/home/node/.openclaw/workspace'
 All workspace containment validation tests passed!
 
 === TEST 4: Verifying OpenClaw Plugin Registry Discovery ===
