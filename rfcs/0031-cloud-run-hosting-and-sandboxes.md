@@ -6,7 +6,7 @@ created: 2026-09-25
 last_updated: 2026-09-28
 status: draft
 issue:
-rfc_pr:
+rfc_pr: https://github.com/openclaw/rfcs/pull/76
 ---
 
 # Proposal: Cloud Run Hosting and Cloud Run Sandboxes for OpenClaw
