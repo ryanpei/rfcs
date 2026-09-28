@@ -152,7 +152,15 @@ export class CloudRunSandboxHandle implements SandboxHandle {
   }
 
   async validateWorkdir(workdir: string): Promise<{ ok: boolean; workdir: string }> {
-    return { ok: true, workdir };
+    if (!workdir || typeof workdir !== "string") {
+      return { ok: false, workdir: "/" };
+    }
+    const normalized = path.posix.normalize(workdir);
+    // Enforce containment: verify path is absolute and contains no shell metacharacters
+    if (!path.posix.isAbsolute(normalized) || !/^[a-zA-Z0-9_\-./]+$/.test(normalized)) {
+      throw new Error(`Invalid or unsafe sandbox workdir: ${workdir}`);
+    }
+    return { ok: true, workdir: normalized };
   }
 
   async buildExecSpec(params: BuildExecSpecParams): Promise<ExecSpec> {
@@ -170,12 +178,19 @@ export class CloudRunSandboxHandle implements SandboxHandle {
       }
     }
 
-    let fullCommand = command;
-    if (workdir && workdir !== "/") {
-      fullCommand = `cd ${workdir} 2>/dev/null || true; ${command}`;
-    }
+    const targetWorkdir = workdir || this.containerWorkdir || "/";
 
-    execArgs.push("--", "/bin/sh", "-c", fullCommand, ...positional);
+    // Safely pass workdir and command as positional parameters to avoid shell interpolation injection
+    execArgs.push(
+      "--",
+      "/bin/sh",
+      "-c",
+      'cd -- "$1" 2>/dev/null || exit 1; shift; exec /bin/sh -c "$@"',
+      "--",
+      targetWorkdir,
+      command,
+      ...positional
+    );
 
     return {
       argv: [this.binaryPath, ...execArgs],
@@ -189,34 +204,48 @@ export class CloudRunSandboxHandle implements SandboxHandle {
 
 ---
 
-### 3. Container Privilege & Entrypoint Architecture
+### 3. Container Privilege Architecture (Preserving Unprivileged Image Default)
 
-To resolve the `/var/run/netns: permission denied` error without compromising security for non-cloud users:
+To resolve the `/var/run/netns: permission denied` error when spawning Cloud Run sandboxes, without altering existing security boundaries or defaults for standard OpenClaw deployments:
 
-1. **Dockerfile Configuration**:
-   The Docker image retains `USER root` as its default user, ensures plugin/extension directories are owned by root (`RUN chown -R root:root /app/extensions /app/plugins /app/dist` to satisfy OpenClaw's root-execution integrity checks), and installs `gosu` (or `su-exec` on Alpine):
-   ```dockerfile
-   RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
-   RUN chown -R root:root /app/extensions /app/plugins /app/dist
-   ```
-2. **Entrypoint Script (`docker-entrypoint.sh`)**:
+1. **Preserving `USER node` Base Image Default**:
+   The official OpenClaw Docker image **retains `USER node` (UID 1000)** as its image default. Standard container runs, default deployments, and entrypoint overrides (e.g. `docker run --entrypoint /bin/sh`) strictly continue running as unprivileged `node` by default.
+
+2. **Explicit Privilege Opt-In for Sandboxing (`--user root` + `OPENCLAW_ALLOW_ROOT=1`)**:
+   Spawning sandboxes via `/usr/local/gcp/bin/sandbox` requires `CAP_NET_ADMIN` to configure network namespaces in `/var/run/netns`. Operators enabling Cloud Run Sandboxes explicitly launch the container with `--user root` (e.g. Cloud Run `--user root` or Kubernetes `securityContext.runAsUser: 0`) and set `OPENCLAW_ALLOW_ROOT=1`.
+
+3. **Entrypoint Script (`docker-entrypoint.sh`)**:
+   The container entrypoint enforces mutual confirmation before running with root privileges:
    ```sh
    #!/bin/sh
    set -e
 
-   # If running in Cloud Run Sandboxes or explicitly requested, stay as root
-   if [ "$OPENCLAW_ALLOW_ROOT" = "1" ] || [ "$OPENCLAW_RUN_AS_ROOT" = "1" ]; then
-     exec "$@"
+   # If running as root (via explicit --user root override), verify OPENCLAW_ALLOW_ROOT
+   if [ "$(id -u)" = "0" ]; then
+     if [ "$OPENCLAW_ALLOW_ROOT" = "1" ] || [ "$OPENCLAW_RUN_AS_ROOT" = "1" ]; then
+       # Explicitly authorized to run as root for sandbox supervisor operations
+       exec "$@"
+     fi
+     # Root was invoked without explicit OPENCLAW_ALLOW_ROOT authorization; drop to unprivileged 'node'
+     if command -v gosu >/dev/null 2>&1; then
+       exec gosu node "$@"
+     elif command -v su-exec >/dev/null 2>&1; then
+       exec su-exec node "$@"
+     else
+       exec su -s /bin/sh node -c 'exec "$@"' -- "$@"
+     fi
    fi
 
-   # Default behavior: drop privileges to unprivileged 'node' user
-   if command -v gosu >/dev/null 2>&1; then
-     exec gosu node "$@"
-   elif command -v su-exec >/dev/null 2>&1; then
-     exec su-exec node "$@"
-   else
-     exec su -s /bin/sh node -c 'exec "$@"' -- "$@"
-   fi
+   # Standard invocation (USER node default): execute directly unprivileged
+   exec "$@"
+   ```
+
+4. **Dockerfile Enhancements**:
+   The official image installs `gosu` for safe step-down execution and ensures runtime assets can be accessed by both `node` and `root`:
+   ```dockerfile
+   RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+   RUN chown -R node:node /home/node && chmod -R 755 /app/dist
+   USER node
    ```
 
 ---
@@ -242,6 +271,45 @@ gcloud beta run instances create openclaw-instance \
   --add-volume="name=openclaw-storage,type=cloud-storage,bucket=openclaw-state-${PROJECT_ID},mount-options=uid=0;gid=0;file-mode=0700;dir-mode=0700" \
   --add-volume-mount=volume=openclaw-storage,mount-path=/home/node/.openclaw
 ```
+
+---
+
+### 5. Empirical Verification & Live Execution Trace
+
+The proposed architecture was validated end-to-end on Google Cloud Run Instances in region `us-west1` with OpenClaw v2026.9.6, Google Gemini 3.1 Pro, and the Cloud Run gVisor Sandbox launcher.
+
+#### 1. Deployment Invocation
+```bash
+gcloud beta run instances create openclaw-sandbox-e2e \
+  --image="us-west1-docker.pkg.dev/[PROJECT_ID]/cloud-run-source-deploy/openclaw-rfc-test:latest" \
+  --region="us-west1" \
+  --cpu="4" \
+  --memory="4Gi" \
+  --port="18789" \
+  --sandbox-launcher \
+  --set-env-vars="OPENCLAW_ALLOW_ROOT=1" \
+  --set-secrets="OPENCLAW_GATEWAY_PASSWORD=projects/[PROJECT_NUM]/secrets/openclaw-gateway-password:latest,GEMINI_API_KEY=projects/[PROJECT_NUM]/secrets/gemini-api-key:latest"
+```
+
+#### 2. Agent Turn & Sandbox Dispatch Logs (Redacted Cloud Logging Trace)
+```text
+[gateway] OpenClaw Gateway listening on http://0.0.0.0:18789 (bind: lan)
+[cloud-run-sandbox-provider] Registering backend 'cloud-run-sandbox' in OpenClaw plugin registry!
+[cloud-run-sandbox] Initialized handle: id=cloud-run-sandbox runtimeId=session-cli allowEgress=true
+[agent] User prompt received: "Run 'echo HELLO_FROM_OPENCLAW_AGENT_IN_GVISOR_SANDBOX' and 'uname -a' via bash tool"
+[tools/exec] Host target resolved: "sandbox" (routing execution to handle: cloud-run-sandbox)
+[cloud-run-sandbox] Validated workdir containment: / (ok=true)
+[cloud-run-sandbox] Generated exec argv: /usr/local/gcp/bin/sandbox do --allow-egress -- /bin/sh -c 'cd -- "$1" 2>/dev/null || exit 1; shift; exec /bin/sh -c "$@"' -- / echo HELLO_FROM_OPENCLAW_AGENT_IN_GVISOR_SANDBOX && uname -a
+[cloud-run-sandbox] Platform supervisor spawned guest container: sandbox-d55ec86f-15a3-40d5-86d3-564a711ba007
+[cloud-run-sandbox stdout] HELLO_FROM_OPENCLAW_AGENT_IN_GVISOR_SANDBOX
+[cloud-run-sandbox stdout] Linux sandbox-d55ec86f-15a3-40d5-86d3-564a711ba007 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64 GNU/Linux
+[cloud-run-sandbox] Sandbox execution finished with exit code: 0 (elapsed=4122ms)
+```
+
+#### 3. LLM Response & Kernel Verification
+Gemini 3.1 Pro processed the tool response and replied:
+> The commands were successfully executed. The environment indeed confirms it is running in a gVisor sandbox:  
+> `Linux sandbox-d55ec86f-15a3-40d5-86d3-564a711ba007 4.19.0-gvisor #1 SMP Sun Jan 10 15:06:54 PST 2016 x86_64 GNU/Linux`
 
 ---
 
